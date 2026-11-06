@@ -14,8 +14,10 @@ charged to the right spool.
 
 Settings (environment variables):
   PRINTER_HOST          printer IP or name (required)
-  PRINTER_SERIAL        serial number, from the printer's network settings (required)
-  PRINTER_CHECK_CODE    check code, from the same screen (required)
+  PRINTER_SERIAL        serial number, from the printer's network settings
+  PRINTER_CHECK_CODE    check code, from the same screen; both are taken from a mounted
+                        FlashForge WebUI folder when not set (credentials.py)
+  FLASHFORGE_WEBUI_DIR  that folder, /import/flashforge-webui
   PRINTER_PORT          local API port, 8898
   SPOOLMAN_URL          e.g. http://spoolman:8000 (required)
   SLOT_LOCATION         Spoolman location of slot N, "Creator 5 Pro / Slot {slot}"
@@ -52,6 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 
 from allocate import allocate
+from credentials import resolve
 from assign import choose, describe, slot_key
 from gcode_usage import SlicedUsage, parse_sliced_file
 from tracker import Event, Snapshot, Tracker, snapshot_from_detail
@@ -88,13 +91,23 @@ class Config:
         self.count_idle = env_bool("COUNT_IDLE_USE", True)
         self.poll_s = float(env("POLL_INTERVAL_S", "3"))
         self.data_dir = Path(env("DATA_DIR", "/data"))
+        self.webui_dir = Path(env("FLASHFORGE_WEBUI_DIR", "/import/flashforge-webui"))
         self.port = int(env("PORT", "8000"))
 
     def check(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        # The entrypoint copies the WebUI files into DATA_DIR/import as root, in case
+        # they are not readable by the service's own user.
+        self.serial, self.check_code, self.printer_host, source = resolve(
+            self.serial, self.check_code, self.printer_host, self.data_dir,
+            [self.data_dir / "import", self.webui_dir])
+        if not (self.serial and self.check_code):
+            log.error("printer serial number and check code: %s", source)
         missing = [n for n, v in (("PRINTER_HOST", self.printer_host), ("PRINTER_SERIAL", self.serial),
                                   ("PRINTER_CHECK_CODE", self.check_code), ("SPOOLMAN_URL", self.spoolman)) if not v]
         if missing:
-            raise SystemExit(f"Missing settings: {', '.join(missing)}")
+            raise SystemExit(f"Missing settings: {', '.join(missing)}. The serial number and check code can also "
+                             f"come from a FlashForge WebUI data folder mounted at {self.webui_dir}.")
 
 
 # ---------------------------------------------------------------------------
