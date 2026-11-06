@@ -11,6 +11,8 @@ on:
       - tests/**
       - requirements.txt
       - Dockerfile
+      - entrypoint.sh
+      - .dockerignore
       - .github/workflows/image.yml
   schedule:
     - cron: "23 4 * * 1"
@@ -72,8 +74,8 @@ jobs:
           done
           curl -sf http://127.0.0.1:8000/status | tee status.json
           python3 -c "import json; s = json.load(open('status.json')); assert s['printer_online'] is False, s"
-          docker top smoke -eo uid,args | tee top.txt
-          grep -q "^10001 .*service.py" top.txt
+          docker top smoke -eo pid,uid,args | tee top.txt
+          grep -Eq "^ *[0-9]+ +10001 .*service.py" top.txt
           docker stop smoke
           docker logs smoke
           sudo test -s smoke-data/state.json
