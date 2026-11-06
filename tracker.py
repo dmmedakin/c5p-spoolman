@@ -208,6 +208,11 @@ class Tracker:
         self.state["idle_m"] = {k: v for k, v in self.state["idle_m"].items() if v > 0}
         return events
 
+    def flush_slot(self, slot: int) -> list[Event]:
+        """Close the idle use of one slot now, e.g. before its spool is swapped."""
+        metres = self.state["idle_m"].pop(str(slot), 0.0)
+        return [Event("idle_use", {"slot": str(slot), "metres": metres})] if metres > 0 else []
+
     def observe(self, snap: Snapshot, now: float | None = None) -> list[Event]:
         """Fold one reading in; returns what became final with it."""
         now = time.time() if now is None else now

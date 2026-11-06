@@ -5,6 +5,7 @@ Not part of the image's checks: it needs Spoolman on :7912 and PrintStash on
     python tests/integration_test.py <printstash-user> <printstash-api-key>
 """
 
+import atexit
 import json
 import os
 import random
@@ -18,6 +19,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 
+RUN = f"run{random.randint(1000, 9999)}"   # fresh slot locations, so reruns on one Spoolman do not clash
+SLOT_LOC = "Creator 5 Pro / Slot {slot} / " + RUN
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPOOLMAN = "http://127.0.0.1:7912/api/v1"
 PRINTSTASH = "http://127.0.0.1:8000/api/v1"
@@ -55,8 +58,10 @@ class Handler(BaseHTTPRequestHandler):
                 out = {"code": 1, "message": "bad check code"}
             else:
                 out = {"code": 0, "message": "Success", "detail": PRINTER}
-        else:  # ntfy topic
-            NTFY.append({"title": self.headers.get("Title"), "body": body.decode(), "tags": self.headers.get("Tags")})
+        else:  # ntfy, published as JSON to the server root
+            msg = json.loads(body)
+            NTFY.append({"topic": msg.get("topic"), "title": msg.get("title"), "body": msg.get("message", ""),
+                         "actions": msg.get("actions") or []})
             out = {"id": "x"}
         data = json.dumps(out).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
@@ -78,11 +83,16 @@ def set_printer(status=None, file=None, cum=None, slot=None, duration=None):
 # ---- seed Spoolman and PrintStash ---------------------------------------------
 
 c = httpx.Client(timeout=30)
+# Spools of this test's own vendor left by earlier runs would compete for the
+# matches: archive them (only "TestVendor", which nothing else uses).
+for old in c.get(f"{SPOOLMAN}/spool").json():
+    if ((old.get("filament") or {}).get("vendor") or {}).get("name") == "TestVendor":
+        c.patch(f"{SPOOLMAN}/spool/{old['id']}", json={"archived": True})
 vendor = c.post(f"{SPOOLMAN}/vendor", json={"name": "TestVendor"}).json()
 pla = c.post(f"{SPOOLMAN}/filament", json={"name": "Test PLA", "vendor_id": vendor["id"], "material": "PLA", "density": 1.24, "diameter": 1.75, "weight": 1000}).json()
 spools = {}
 for slot in (1, 3):
-    spools[slot] = c.post(f"{SPOOLMAN}/spool", json={"filament_id": pla["id"], "location": f"Creator 5 Pro / Slot {slot}"}).json()
+    spools[slot] = c.post(f"{SPOOLMAN}/spool", json={"filament_id": pla["id"], "location": SLOT_LOC.format(slot=slot)}).json()
 spools["shelf"] = c.post(f"{SPOOLMAN}/spool", json={"filament_id": pla["id"], "location": "Study / Shelf"}).json()
 
 
@@ -113,12 +123,18 @@ data_dir = tempfile.mkdtemp()
 ENV = dict(os.environ, PRINTER_HOST="127.0.0.1", PRINTER_PORT="18898", PRINTER_SERIAL="SN123", PRINTER_CHECK_CODE="CC456",
            SPOOLMAN_URL="http://127.0.0.1:7912", PRINTSTASH_URL="http://127.0.0.1:8000", PRINTSTASH_USERNAME=PS_USER,
            PRINTSTASH_API_KEY=PS_KEY, NTFY_URL="http://127.0.0.1:18898/c5p", POLL_INTERVAL_S="0.2",
+           PUBLIC_URL="http://127.0.0.1:18899", SLOT_LOCATION=SLOT_LOC,
            DATA_DIR=data_dir, PORT="18899")
 
 
+PROCS: list[subprocess.Popen] = []
+atexit.register(lambda: [p.kill() for p in PROCS if p.poll() is None])  # never leave a service polling
+
+
 def start():
-    return subprocess.Popen([sys.executable, os.path.join(HERE, "service.py")], env=ENV, cwd=HERE,
-                            stdout=open(os.path.join(data_dir, "log.txt"), "a"), stderr=subprocess.STDOUT)
+    PROCS.append(subprocess.Popen([sys.executable, os.path.join(HERE, "service.py")], env=ENV, cwd=HERE,
+                            stdout=open(os.path.join(data_dir, "log.txt"), "a"), stderr=subprocess.STDOUT))
+    return PROCS[-1]
 
 
 def step(**kw):
@@ -185,7 +201,8 @@ cum += 0.25; step(cum=cum)
 step(slot=4); cum += 0.3; step(cum=cum)
 time.sleep(1)
 check("idle use charged to slot 3", abs(used_g(spools[3]["id"]) - before3 - 250 * grams_per_mm) < 0.05)
-check("idle use on an empty slot is reported", any("Slot 4" in n["body"] and "no spool" in n["body"] for n in NTFY), str(NTFY))
+check("idle use on a slot without a matching spool is reported",
+      any("Slot 4" in n["body"] and "no PETG spool" in n["body"] for n in NTFY), str(NTFY))
 check("spool on the shelf untouched", used_g(spools["shelf"]["id"]) == 0)
 
 # 4. Cancelled job: live attribution, no sliced-file split.
@@ -198,7 +215,62 @@ time.sleep(1.5)
 d1, d3 = used_g(spools[1]["id"]) - before1, used_g(spools[3]["id"]) - before3
 check("cancelled job charged by live attribution", abs(d1 - 600 * grams_per_mm) < 0.05 and abs(d3 - 300 * grams_per_mm) < 0.05, f"{d1} {d3}")
 
-# 5. Wrong check code: the service reports it and charges nothing.
+# 5. Automatic assignment: spools on the shelf, matched by what the slot reports.
+def spool_of(name, color):
+    f = c.post(f"{SPOOLMAN}/filament", json={"name": name, "vendor_id": vendor["id"], "material": "PLA+",
+                                            "density": 1.24, "diameter": 1.75, "weight": 1000, "color_hex": color}).json()
+    return c.post(f"{SPOOLMAN}/spool", json={"filament_id": f["id"], "location": "Study / Shelf"}).json()
+
+
+ice, pink, rose = spool_of("Ice Blue", "A8D8EA"), spool_of("Light Pink", "E1A6AD"), spool_of("Rose Quartz", "C98BA8")
+
+
+def loc(spool_id):
+    return c.get(f"{SPOOLMAN}/spool/{spool_id}").json().get("location")
+
+
+def set_slot(slot, material, color):
+    info = PRINTER["matlStationInfo"]["slotInfos"][slot - 1]
+    info.update(materialName=material, materialColor=color, hasFilament=True)
+
+
+NTFY.clear()
+set_slot(2, "PLA", "#A8D8EA")
+time.sleep(1)
+check("loaded spool gets the slot's location", loc(ice["id"]) == SLOT_LOC.format(slot=2), loc(ice["id"]))
+check("a clear match is announced without buttons",
+      any(n["title"] == "Slot 2: spool loaded" and not n["actions"] for n in NTFY), str(NTFY))
+step(slot=2); cum += 0.3; step(cum=cum); time.sleep(0.6)
+check("idle use goes to the assigned spool", abs(used_g(ice["id"]) - 300 * grams_per_mm) < 0.05, used_g(ice["id"]))
+
+NTFY.clear()
+set_slot(2, "PLA", "#F2A7B5")       # swapped for a pink one; two pinks are close
+time.sleep(1)
+check("swapped-out spool goes back to its place", loc(ice["id"]) == "Study / Shelf", loc(ice["id"]))
+check("best guess takes the slot", loc(pink["id"]) == SLOT_LOC.format(slot=2), loc(pink["id"]))
+doubt = [n for n in NTFY if n["title"] == "Slot 2: best guess"]
+check("a doubtful match offers the other spool as a button",
+      bool(doubt) and any(f"spool={rose['id']}" in a["url"] for a in doubt[0]["actions"]), str(NTFY))
+cum += 0.4; step(cum=cum); time.sleep(0.6)
+check("use charged to the best guess", abs(used_g(pink["id"]) - 400 * grams_per_mm) < 0.05, used_g(pink["id"]))
+
+bad = httpx.post(doubt[0]["actions"][0]["url"].replace("token=", "token=x"))
+check("a wrong token is refused", bad.status_code == 403, bad.status_code)
+tap = httpx.post(doubt[0]["actions"][0]["url"])
+check("tapping the button corrects the slot", tap.status_code == 200 and loc(rose["id"]) == SLOT_LOC.format(slot=2),
+      f"{tap.status_code} {tap.text} {loc(rose['id'])}")
+check("the wrong guess goes back to its place", loc(pink["id"]) == "Study / Shelf", loc(pink["id"]))
+check("what was charged moves to the right spool",
+      used_g(pink["id"]) == 0 and abs(used_g(rose["id"]) - 400 * grams_per_mm) < 0.05,
+      f"{used_g(pink['id'])} {used_g(rose['id'])}")
+cum += 0.1; step(cum=cum); set_slot(2, "PLA", "#A8D8EA"); time.sleep(1)
+check("use just before a swap stays with the old spool",
+      abs(used_g(rose["id"]) - 500 * grams_per_mm) < 0.05 and loc(ice["id"]) == SLOT_LOC.format(slot=2),
+      f"{used_g(rose['id'])} {loc(ice['id'])}")
+st = httpx.get("http://127.0.0.1:18899/status").json()
+check("status lists the slots", st["slots"]["2"]["spool_id"] == ice["id"], st["slots"])
+
+# 6. Wrong check code: the service reports it and charges nothing.
 proc.terminate(); proc.wait()
 ENV["PRINTER_CHECK_CODE"] = "wrong"
 proc = start(); time.sleep(1.5)

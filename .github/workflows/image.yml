@@ -42,7 +42,7 @@ jobs:
       - name: Unit tests
         run: |
           pip install -r requirements.txt pytest
-          PYTHONPATH=. pytest -q tests/test_logic.py
+          PYTHONPATH=. pytest -q tests/test_logic.py tests/test_assign.py
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

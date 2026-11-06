@@ -6,6 +6,12 @@ sliced file from PrintStash when it is there) and deducts the result from the
 spool Spoolman has in that slot. A spool is "in slot N" when its Spoolman
 location is SLOT_LOCATION with {slot} filled in, e.g. "Creator 5 Pro / Slot 2".
 
+That location is set by the service itself (assign.py): when a slot's material
+or colour changes on the printer, the matching spool is moved into the slot
+and the one taken out goes back where it was. A doubtful match is reported
+with buttons to correct it in one tap; a correction moves what was already
+charged to the right spool.
+
 Settings (environment variables):
   PRINTER_HOST          printer IP or name (required)
   PRINTER_SERIAL        serial number, from the printer's network settings (required)
@@ -18,6 +24,10 @@ Settings (environment variables):
   PRINTSTASH_API_KEY    with PRINTSTASH_URL
   NTFY_URL              optional: full topic URL for a message per job
   NTFY_TOKEN            optional ntfy access token
+  PUBLIC_URL            how the phone reaches this service, e.g. http://192.168.0.96:3065;
+                        enables the correction buttons in ntfy messages
+  ACTION_TOKEN          secret for those buttons; generated and kept in DATA_DIR if unset
+  AUTO_ASSIGN           true: match loaded spools to Spoolman and set their location
   COUNT_IDLE_USE        true: also charge filament moved between jobs (loading, purges)
   POLL_INTERVAL_S       3
   DRY_RUN               true: log what would be charged, change nothing
@@ -32,14 +42,18 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import time
 from pathlib import Path
 from typing import Any
 
+from urllib.parse import parse_qs, urlsplit
+
 import httpx
 
 from allocate import allocate
+from assign import choose, describe, slot_key
 from gcode_usage import SlicedUsage, parse_sliced_file
 from tracker import Event, Snapshot, Tracker, snapshot_from_detail
 
@@ -69,6 +83,9 @@ class Config:
         self.ps_key = env("PRINTSTASH_API_KEY")
         self.ntfy_url = env("NTFY_URL")
         self.ntfy_token = env("NTFY_TOKEN")
+        self.public_url = env("PUBLIC_URL").rstrip("/")
+        self.action_token = env("ACTION_TOKEN")
+        self.auto_assign = env_bool("AUTO_ASSIGN", True)
         self.count_idle = env_bool("COUNT_IDLE_USE", True)
         self.poll_s = float(env("POLL_INTERVAL_S", "3"))
         self.dry_run = env_bool("DRY_RUN", False)
@@ -125,6 +142,24 @@ class Spoolman:
             names = ", ".join(f"#{s['id']}" for s in spools)
             return None, f"several spools have location '{self.location(slot)}' ({names})"
         return spools[0], None
+
+    async def spools(self) -> list[dict[str, Any]]:
+        r = await self.http.get(f"{self.base}/spool", timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    async def spool(self, spool_id: int) -> dict[str, Any]:
+        r = await self.http.get(f"{self.base}/spool/{spool_id}", timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    async def set_location(self, spool_id: int, location: str | None) -> None:
+        r = await self.http.patch(f"{self.base}/spool/{spool_id}", json={"location": location or None}, timeout=10)
+        r.raise_for_status()
+
+    @staticmethod
+    def same_place(a: str | None, b: str | None) -> bool:
+        return re.sub(r"\s+", " ", a or "").strip().lower() == re.sub(r"\s+", " ", b or "").strip().lower()
 
     async def use_length(self, spool_id: int, mm: float) -> dict[str, Any]:
         r = await self.http.put(f"{self.base}/spool/{spool_id}/use", json={"use_length": round(mm, 2)}, timeout=10)
@@ -201,17 +236,27 @@ class PrintStash:
 
 
 class Ntfy:
-    def __init__(self, cfg: Config, http: httpx.AsyncClient) -> None:
-        self.url, self.token, self.http = cfg.ntfy_url, cfg.ntfy_token, http
+    """Publishes as JSON, which keeps titles and button labels in UTF-8."""
 
-    async def send(self, title: str, body: str, tags: str = "printer") -> None:
-        if not self.url:
+    def __init__(self, cfg: Config, http: httpx.AsyncClient) -> None:
+        self.token, self.http = cfg.ntfy_token, http
+        url = cfg.ntfy_url.rstrip("/")
+        self.base, _, self.topic = url.rpartition("/")
+
+    async def send(self, title: str, body: str, tags: str = "printer",
+                   actions: list[tuple[str, str]] | None = None) -> None:
+        """actions: up to three (label, url) buttons; tapping one POSTs to url."""
+        if not self.topic or not self.base.startswith("http"):
             return
-        headers = {"Title": title.encode("utf-8").decode("latin-1", "ignore"), "Tags": tags}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        msg: dict[str, Any] = {"topic": self.topic, "title": title, "message": body, "tags": tags.split(",")}
+        if actions:
+            msg["actions"] = [{"action": "http", "label": label[:40], "url": url, "method": "POST", "clear": True}
+                              for label, url in actions[:3]]
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         try:
-            await self.http.post(self.url, content=body.encode("utf-8"), headers=headers, timeout=10)
+            r = await self.http.post(self.base, json=msg, headers=headers, timeout=10)
+            if r.status_code >= 400:
+                log.warning("ntfy refused: %s %s", r.status_code, r.text[:200])
         except httpx.HTTPError as e:
             log.warning("ntfy failed: %s", e)
 
@@ -234,6 +279,9 @@ class Service:
         self.history_path = cfg.data_dir / "history.jsonl"
         state = self._load()
         self.pending: list[dict[str, Any]] = state.pop("pending", [])
+        # slot -> {key, spool_id, spool, prev_location, doubtful, charged_mm, problem}
+        self.slots: dict[str, dict[str, Any]] = state.pop("slots", {})
+        self.token = cfg.action_token or self._token()
         self.tracker = Tracker(state.get("tracker"), count_idle=cfg.count_idle)
         self.online = False
         self.last_snapshot: Snapshot | None = None
@@ -242,6 +290,15 @@ class Service:
         self._saved_at = 0.0
 
     # --- persistence -----------------------------------------------------
+
+    def _token(self) -> str:
+        path = self.cfg.data_dir / "action_token"
+        try:
+            return path.read_text().strip()
+        except FileNotFoundError:
+            token = secrets.token_urlsafe(24)
+            path.write_text(token)
+            return token
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -256,7 +313,7 @@ class Service:
         if not force and time.time() - self._saved_at < 30:
             return
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"tracker": self.tracker.state, "pending": self.pending}))
+        tmp.write_text(json.dumps({"tracker": self.tracker.state, "pending": self.pending, "slots": self.slots}))
         os.replace(tmp, self.state_path)
         self._saved_at = time.time()
 
@@ -271,7 +328,7 @@ class Service:
         done = item.setdefault("charged", {})
         if str(slot) in done:
             return done[str(slot)]
-        spool, problem = await self.spoolman.spool_in_slot(slot)
+        spool, problem = await self._spool_for(item, slot)
         if not spool:
             result = {"slot": slot, "mm": mm, "charged": False, "problem": problem}
         elif self.cfg.dry_run:
@@ -285,8 +342,28 @@ class Service:
                       "grams": round(float(updated.get("used_weight") or 0) - before, 2),
                       "remaining_g": updated.get("remaining_weight")}
         done[str(slot)] = result
+        cur = self.slots.get(str(slot))
+        if result.get("charged") and cur and cur.get("spool_id") == result.get("spool_id"):
+            cur["charged_mm"] = round(cur.get("charged_mm", 0.0) + mm, 2)
         self.save()
         return result
+
+    async def _spool_for(self, item: dict[str, Any], slot: int) -> tuple[dict[str, Any] | None, str | None]:
+        """The spool that was in the slot when the use happened."""
+        sid = (item.get("slot_spools") or {}).get(str(slot))
+        if sid:
+            try:
+                return await self.spoolman.spool(int(sid)), None
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
+        spool, problem = await self.spoolman.spool_in_slot(slot)
+        if spool:
+            return spool, None
+        cur = self.slots.get(str(slot)) or {}
+        if cur.get("spool_id"):  # dry run: the location was not written
+            return await self.spoolman.spool(int(cur["spool_id"])), None
+        return None, cur.get("problem") or problem
 
     async def _settle_job(self, item: dict[str, Any]) -> None:
         job = item["data"]
@@ -353,9 +430,10 @@ class Service:
     # --- loop ------------------------------------------------------------
 
     def _queue(self, events: list[Event]) -> None:
+        spools = {k: v["spool_id"] for k, v in self.slots.items() if v.get("spool_id")}
         for ev in events:
             log.info("%s: %s", ev.kind, json.dumps(ev.data)[:300])
-            self.pending.append({"kind": ev.kind, "data": ev.data, "at": time.time()})
+            self.pending.append({"kind": ev.kind, "data": ev.data, "at": time.time(), "slot_spools": dict(spools)})
         if events:
             self.save()
 
@@ -374,7 +452,131 @@ class Service:
         self.online = True
         self.last_snapshot = snap
         self._queue(self.tracker.observe(snap))
+        if self.cfg.auto_assign:
+            await self.sync_slots(snap)
         self.save(force=False)
+
+    # --- which spool is in which slot ------------------------------------
+
+    def _url(self, slot: int, spool_id: int) -> str:
+        return f"{self.cfg.public_url}/assign?slot={slot}&spool={spool_id}&token={self.token}"
+
+    async def sync_slots(self, snap: Snapshot) -> None:
+        """Follow spool swaps: a slot whose material or colour changed got a new spool."""
+        for sl in snap.slots:
+            key = slot_key(sl.loaded, sl.material, sl.color)
+            cur = self.slots.get(str(sl.id))
+            if cur and cur.get("key") == key:
+                continue
+            if cur and self.tracker.job:  # a swap mid-print is settled once the job is charged
+                continue
+            try:
+                await self._swap(sl, key, cur)
+            except httpx.HTTPError as e:
+                self.last_error = f"assigning slot {sl.id}: {e}"
+                log.warning("could not assign slot %s: %s", sl.id, e)
+                return  # Spoolman unreachable: try again next tick
+
+    async def _swap(self, sl: Any, key: str, cur: dict[str, Any] | None) -> None:
+        slot, here = sl.id, self.spoolman.location(sl.id)
+        # Use that happened with the old spool belongs to it.
+        self._queue(self.tracker.flush_slot(slot))
+        spools = await self.spoolman.spools()
+        by_id = {int(s["id"]): s for s in spools}
+        if cur and cur.get("spool_id"):
+            old = by_id.get(int(cur["spool_id"]))
+            await self._release(slot, cur, old)
+            if old and self.spoolman.same_place(old.get("location"), here):
+                old["location"] = cur.get("prev_location")  # it is no longer here
+        entry: dict[str, Any] = {"key": key, "spool_id": None, "charged_mm": 0.0,
+                                 "material": sl.material, "color": sl.color, "since": time.time()}
+        self.slots[str(slot)] = entry
+        if not sl.loaded:
+            self.save()
+            return
+        if not sl.material or sl.material in ("?", "UNKNOWN"):
+            entry["problem"] = "material not set on the printer screen"
+            self.save()
+            return
+        taken = {int(v["spool_id"]) for k, v in self.slots.items() if k != str(slot) and v.get("spool_id")}
+        here_ids = [int(s["id"]) for s in spools if self.spoolman.same_place(s.get("location"), here)]
+        log.info("slot %s changed to %s; was %s; spools here: %s", slot, key, cur and cur.get("spool_id"), here_ids)
+        choice = choose(sl.material, sl.color, spools, taken=taken,
+                        already_here=here_ids[0] if len(here_ids) == 1 else None)
+        if not choice.spool:
+            entry["problem"] = f"{choice.reason}; loaded {sl.material} {sl.color}"
+            self.save()
+            await self.ntfy.send(f"Slot {slot}: which spool?",
+                                 f"{sl.material} {sl.color} loaded, but {choice.reason}. Its use is not charged "
+                                 f"until a spool in Spoolman has the location '{here}'.", "warning")
+            return
+        await self._place(slot, entry, choice.spool, doubtful=choice.doubtful)
+        body = f"{describe(choice.spool)} ({sl.material} {sl.color})"
+        actions = []
+        if choice.doubtful:
+            body += "\nOther close matches: " + ", ".join(describe(s) for s, _ in choice.alternatives)
+            if self.cfg.public_url:
+                actions = [(f"It is {describe(s)}", self._url(slot, int(s["id"]))) for s, _ in choice.alternatives]
+            else:
+                body += f"\nTo correct it, set the right spool's location to '{here}'."
+        await self.ntfy.send(f"Slot {slot}: {'best guess' if choice.doubtful else 'spool loaded'}",
+                             body + (" [dry run]" if self.cfg.dry_run else ""),
+                             "question" if choice.doubtful else "thread", actions)
+
+    async def _place(self, slot: int, entry: dict[str, Any], spool: dict[str, Any], doubtful: bool = False) -> None:
+        here = self.spoolman.location(slot)
+        prev = spool.get("location")
+        entry.update(spool_id=int(spool["id"]), spool=describe(spool), doubtful=doubtful, problem=None,
+                     prev_location=None if self.spoolman.same_place(prev, here) else prev)
+        if not self.cfg.dry_run and not self.spoolman.same_place(prev, here):
+            await self.spoolman.set_location(int(spool["id"]), here)
+        self.save()
+        log.info("slot %s: %s%s", slot, describe(spool), " (doubtful)" if doubtful else "")
+        self.record({"type": "assign", "at": time.time(), "slot": slot, "spool_id": int(spool["id"]),
+                     "spool": describe(spool), "doubtful": doubtful, "dry_run": self.cfg.dry_run})
+
+    async def _release(self, slot: int, cur: dict[str, Any], spool: dict[str, Any] | None) -> None:
+        """The spool left the slot: give it back the place it came from."""
+        if not spool or self.cfg.dry_run:
+            return
+        if self.spoolman.same_place(spool.get("location"), self.spoolman.location(slot)):
+            await self.spoolman.set_location(int(spool["id"]), cur.get("prev_location"))
+        self.record({"type": "release", "at": time.time(), "slot": slot, "spool_id": int(spool["id"]),
+                     "to": cur.get("prev_location")})
+
+    async def correct(self, slot: int, spool_id: int) -> str:
+        """A tap on 'It is ...': put that spool in the slot and move what was charged."""
+        cur = self.slots.get(str(slot))
+        if not cur:
+            return f"slot {slot} is not known"
+        if cur.get("spool_id") == spool_id:
+            return f"slot {slot} already has {cur.get('spool')}"
+        new = await self.spoolman.spool(spool_id)
+        moved = float(cur.get("charged_mm") or 0.0)
+        old_id = cur.get("spool_id")
+        if old_id:
+            old = await self.spoolman.spool(int(old_id))
+            if moved > 0 and not self.cfg.dry_run:
+                await self.spoolman.use_length(int(old_id), -moved)
+            await self._release(slot, cur, old)
+        came_from = None
+        for other_slot, v in self.slots.items():  # it cannot be in two slots
+            if other_slot != str(slot) and v.get("spool_id") == spool_id:
+                came_from = v.get("prev_location")
+                v.update(spool_id=None, spool=None, problem=f"spool #{spool_id} was moved to slot {slot}")
+        await self._place(slot, cur, new)
+        if came_from is not None:
+            cur["prev_location"] = came_from
+        if moved > 0 and not self.cfg.dry_run:
+            await self.spoolman.use_length(spool_id, moved)
+        cur["charged_mm"] = moved
+        for item in self.pending:  # charges not made yet go to the right spool too
+            if (item.get("slot_spools") or {}).get(str(slot)) == old_id:
+                item["slot_spools"][str(slot)] = spool_id
+        self.save()
+        msg = f"slot {slot}: now {describe(new)}" + (f", {moved / 1000:.2f} m moved from #{old_id}" if moved else "")
+        await self.ntfy.send(f"Slot {slot} corrected", msg, "white_check_mark")
+        return msg
 
     async def run(self) -> None:
         stop = asyncio.Event()
@@ -414,6 +616,8 @@ class Service:
             "counter_m": self.tracker.state.get("last_cum_m"),
             "current_job": job and {"file": job["file"], "metres": job["metres"], "partial": job["partial"]},
             "idle_m": self.tracker.state.get("idle_m"),
+            "slots": {k: {f: v.get(f) for f in ("spool_id", "spool", "material", "color", "doubtful", "problem",
+                                                  "charged_mm")} for k, v in sorted(self.slots.items())},
             "pending": len(self.pending),
             "last_error": self.last_error,
             "dry_run": self.cfg.dry_run,
@@ -423,10 +627,25 @@ class Service:
     async def _http(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             line = (await asyncio.wait_for(reader.readline(), 5)).decode("latin-1")
-            path = line.split(" ")[1] if " " in line else "/"
+            parts = line.split(" ")
+            method, target = (parts[0], parts[1]) if len(parts) > 1 else ("GET", "/")
+            url = urlsplit(target)
+            path, query = url.path, {k: v[0] for k, v in parse_qs(url.query).items()}
             while (await asyncio.wait_for(reader.readline(), 5)) not in (b"\r\n", b"\n", b""):
                 pass
-            if path.startswith("/healthz"):
+            if path == "/assign":
+                if method != "POST":
+                    body, code = {"error": "use POST"}, 405
+                elif not secrets.compare_digest(query.get("token", ""), self.token):
+                    body, code = {"error": "bad token"}, 403
+                else:
+                    try:
+                        body, code = {"ok": True, "result": await self.correct(int(query["slot"]), int(query["spool"]))}, 200
+                    except (KeyError, ValueError):
+                        body, code = {"error": "slot and spool are required"}, 400
+                    except httpx.HTTPError as e:
+                        body, code = {"error": f"Spoolman: {e}"}, 502
+            elif path.startswith("/healthz"):
                 alive = time.time() - self.last_tick < max(60, self.cfg.poll_s * 10)
                 body, code = {"ok": alive, "printer_online": self.online}, 200 if alive else 503
             elif path.startswith("/status"):
@@ -434,7 +653,8 @@ class Service:
             else:
                 body, code = {"error": "not found"}, 404
             data = json.dumps(body, ensure_ascii=False, indent=2).encode()
-            reason = {200: "OK", 404: "Not Found", 503: "Service Unavailable"}[code]
+            reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                      502: "Bad Gateway", 503: "Service Unavailable"}[code]
             writer.write(f"HTTP/1.1 {code} {reason}\r\nContent-Type: application/json; charset=utf-8\r\n"
                          f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode() + data)
             await writer.drain()
