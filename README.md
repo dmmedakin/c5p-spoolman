@@ -93,16 +93,14 @@ service matches it against Spoolman:
       PRINTSTASH_API_KEY: "<psk_...>"
       NTFY_URL: https://ntfy.example.com/printer  # optional
       PUBLIC_URL: http://192.168.0.96:3065         # for the correction buttons
-      DRY_RUN: "true"                             # first print: log only
     volumes:
       - /srv/appdata/3dprint/c5p-spoolman:/data
     ports:
       - "3065:8000"
 ```
 
-Run the first print with `DRY_RUN: "true"`. It then changes nothing in
-Spoolman, neither usage nor locations: what it would do shows in `/status`, the
-log and ntfy. Compare it with the printer's own job summary and remove the line.
+After the first print, compare `/status` and `/data/history.jsonl` with the
+printer's own job summary.
 
 ## Settings
 
@@ -122,7 +120,6 @@ log and ntfy. Compare it with the printer's own job summary and remove the line.
 | `AUTO_ASSIGN` | `true` | match loaded spools and set their location |
 | `COUNT_IDLE_USE` | `true` | also charge loading, unloading and purges |
 | `POLL_INTERVAL_S` | `3` | seconds between reads |
-| `DRY_RUN` | `false` | log what would be charged, change nothing |
 | `DATA_DIR` | `/data` | state and history |
 | `PORT` | `8000` | `/healthz` and `/status` |
 

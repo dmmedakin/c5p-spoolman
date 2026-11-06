@@ -30,7 +30,6 @@ Settings (environment variables):
   AUTO_ASSIGN           true: match loaded spools to Spoolman and set their location
   COUNT_IDLE_USE        true: also charge filament moved between jobs (loading, purges)
   POLL_INTERVAL_S       3
-  DRY_RUN               true: log what would be charged, change nothing
   DATA_DIR              /data
   PORT                  8000, for /healthz and /status
 """
@@ -88,7 +87,6 @@ class Config:
         self.auto_assign = env_bool("AUTO_ASSIGN", True)
         self.count_idle = env_bool("COUNT_IDLE_USE", True)
         self.poll_s = float(env("POLL_INTERVAL_S", "3"))
-        self.dry_run = env_bool("DRY_RUN", False)
         self.data_dir = Path(env("DATA_DIR", "/data"))
         self.port = int(env("PORT", "8000"))
 
@@ -331,9 +329,6 @@ class Service:
         spool, problem = await self._spool_for(item, slot)
         if not spool:
             result = {"slot": slot, "mm": mm, "charged": False, "problem": problem}
-        elif self.cfg.dry_run:
-            result = {"slot": slot, "mm": mm, "charged": False, "spool_id": spool["id"],
-                      "spool": (spool.get("filament") or {}).get("name"), "problem": "dry run"}
         else:
             before = float(spool.get("used_weight") or 0)
             updated = await self.spoolman.use_length(int(spool["id"]), mm)
@@ -361,7 +356,7 @@ class Service:
         if spool:
             return spool, None
         cur = self.slots.get(str(slot)) or {}
-        if cur.get("spool_id"):  # dry run: the location was not written
+        if cur.get("spool_id"):  # assigned, but the location did not reach Spoolman
             return await self.spoolman.spool(int(cur["spool_id"])), None
         return None, cur.get("problem") or problem
 
@@ -383,7 +378,7 @@ class Service:
         results = [await self._charge(item, int(slot), mm) for slot, mm in a["per_slot_mm"].items() if mm > 0]
         entry = {"type": "job", "file": job.get("file"), "outcome": job.get("outcome"),
                  "started_at": job.get("started_at"), "ended_at": job.get("ended_at"),
-                 "partial": job.get("partial"), **a, "charges": results, "dry_run": self.cfg.dry_run}
+                 "partial": job.get("partial"), **a, "charges": results}
         self.record(entry)
         await self._notify_job(entry)
 
@@ -393,8 +388,8 @@ class Service:
             self.record({"type": "idle", "unassigned_mm": round(d["metres"] * 1000, 2), "at": item["at"]})
             return
         result = await self._charge(item, int(d["slot"]), round(d["metres"] * 1000, 2))
-        self.record({"type": "idle", "at": item["at"], "charges": [result], "dry_run": self.cfg.dry_run})
-        if not result.get("charged") and result.get("problem") != "dry run":
+        self.record({"type": "idle", "at": item["at"], "charges": [result]})
+        if not result.get("charged"):
             await self.ntfy.send("Filament not charged", f"Slot {d['slot']}: {result.get('problem')}", "warning")
 
     async def _notify_job(self, e: dict[str, Any]) -> None:
@@ -475,6 +470,9 @@ class Service:
             except httpx.HTTPError as e:
                 self.last_error = f"assigning slot {sl.id}: {e}"
                 log.warning("could not assign slot %s: %s", sl.id, e)
+                entry = self.slots.get(str(sl.id))
+                if entry is not cur and entry and not entry.get("spool_id"):
+                    self.slots.pop(str(sl.id))  # the old spool is out; assign the new one next tick
                 return  # Spoolman unreachable: try again next tick
 
     async def _swap(self, sl: Any, key: str, cur: dict[str, Any] | None) -> None:
@@ -520,24 +518,24 @@ class Service:
             else:
                 body += f"\nTo correct it, set the right spool's location to '{here}'."
         await self.ntfy.send(f"Slot {slot}: {'best guess' if choice.doubtful else 'spool loaded'}",
-                             body + (" [dry run]" if self.cfg.dry_run else ""),
+                             body,
                              "question" if choice.doubtful else "thread", actions)
 
     async def _place(self, slot: int, entry: dict[str, Any], spool: dict[str, Any], doubtful: bool = False) -> None:
         here = self.spoolman.location(slot)
         prev = spool.get("location")
+        if not self.spoolman.same_place(prev, here):
+            await self.spoolman.set_location(int(spool["id"]), here)
         entry.update(spool_id=int(spool["id"]), spool=describe(spool), doubtful=doubtful, problem=None,
                      prev_location=None if self.spoolman.same_place(prev, here) else prev)
-        if not self.cfg.dry_run and not self.spoolman.same_place(prev, here):
-            await self.spoolman.set_location(int(spool["id"]), here)
         self.save()
         log.info("slot %s: %s%s", slot, describe(spool), " (doubtful)" if doubtful else "")
         self.record({"type": "assign", "at": time.time(), "slot": slot, "spool_id": int(spool["id"]),
-                     "spool": describe(spool), "doubtful": doubtful, "dry_run": self.cfg.dry_run})
+                     "spool": describe(spool), "doubtful": doubtful})
 
     async def _release(self, slot: int, cur: dict[str, Any], spool: dict[str, Any] | None) -> None:
         """The spool left the slot: give it back the place it came from."""
-        if not spool or self.cfg.dry_run:
+        if not spool:
             return
         if self.spoolman.same_place(spool.get("location"), self.spoolman.location(slot)):
             await self.spoolman.set_location(int(spool["id"]), cur.get("prev_location"))
@@ -556,7 +554,7 @@ class Service:
         old_id = cur.get("spool_id")
         if old_id:
             old = await self.spoolman.spool(int(old_id))
-            if moved > 0 and not self.cfg.dry_run:
+            if moved > 0:
                 await self.spoolman.use_length(int(old_id), -moved)
             await self._release(slot, cur, old)
         came_from = None
@@ -567,7 +565,7 @@ class Service:
         await self._place(slot, cur, new)
         if came_from is not None:
             cur["prev_location"] = came_from
-        if moved > 0 and not self.cfg.dry_run:
+        if moved > 0:
             await self.spoolman.use_length(spool_id, moved)
         cur["charged_mm"] = moved
         for item in self.pending:  # charges not made yet go to the right spool too
@@ -584,8 +582,8 @@ class Service:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
         server = await asyncio.start_server(self._http, "0.0.0.0", self.cfg.port)
-        log.info("watching %s:%s, Spoolman %s, PrintStash %s%s", self.cfg.printer_host, self.cfg.printer_port,
-                 self.cfg.spoolman, self.cfg.printstash or "off", ", DRY RUN" if self.cfg.dry_run else "")
+        log.info("watching %s:%s, Spoolman %s, PrintStash %s", self.cfg.printer_host, self.cfg.printer_port,
+                 self.cfg.spoolman, self.cfg.printstash or "off")
         try:
             while not stop.is_set():
                 await self.tick()
@@ -620,7 +618,6 @@ class Service:
                                                   "charged_mm")} for k, v in sorted(self.slots.items())},
             "pending": len(self.pending),
             "last_error": self.last_error,
-            "dry_run": self.cfg.dry_run,
             "recent": history,
         }
 
