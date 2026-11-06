@@ -1,0 +1,91 @@
+name: Build image
+
+# Tests, then publishes ghcr.io/<owner>/c5p-spoolman for amd64 and arm64:
+# on every push to main that touches the service, every Monday (Python and
+# library fixes), and by hand from the Actions tab.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - tests/**
+      - requirements.txt
+      - Dockerfile
+      - .github/workflows/image.yml
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/c5p-spoolman
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Unit tests
+        run: |
+          pip install -r requirements.txt pytest
+          PYTHONPATH=. pytest -q tests/test_logic.py
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          pull: true
+          tags: c5p-spoolman:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # With no printer and no Spoolman behind it the service must still start,
+      # answer /healthz and report the printer offline.
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke -p 8000:8000 \
+            -e PRINTER_HOST=127.0.0.1 -e PRINTER_SERIAL=x -e PRINTER_CHECK_CODE=y \
+            -e SPOOLMAN_URL=http://127.0.0.1:9 -e POLL_INTERVAL_S=1 \
+            c5p-spoolman:test
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/healthz && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8000/status | tee status.json
+          python3 -c "import json; s = json.load(open('status.json')); assert s['printer_online'] is False, s"
+          docker rm -f smoke
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
