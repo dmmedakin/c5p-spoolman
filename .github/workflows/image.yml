@@ -56,10 +56,13 @@ jobs:
           cache-to: type=gha,mode=max
 
       # With no printer and no Spoolman behind it the service must still start,
-      # answer /healthz and report the printer offline.
+      # answer /healthz and report the printer offline. The data folder is
+      # root-owned, as Docker creates a missing bind mount; the service must
+      # still be able to write its state there.
       - name: Smoke test
         run: |
-          docker run -d --name smoke -p 8000:8000 \
+          sudo mkdir smoke-data
+          docker run -d --name smoke -p 8000:8000 -v "$PWD/smoke-data:/data" \
             -e PRINTER_HOST=127.0.0.1 -e PRINTER_SERIAL=x -e PRINTER_CHECK_CODE=y \
             -e SPOOLMAN_URL=http://127.0.0.1:9 -e POLL_INTERVAL_S=1 \
             c5p-spoolman:test
@@ -69,6 +72,11 @@ jobs:
           done
           curl -sf http://127.0.0.1:8000/status | tee status.json
           python3 -c "import json; s = json.load(open('status.json')); assert s['printer_online'] is False, s"
+          docker top smoke -eo uid,args | tee top.txt
+          grep -q "^10001 .*service.py" top.txt
+          docker stop smoke
+          docker logs smoke
+          sudo test -s smoke-data/state.json
           docker rm -f smoke
 
       - uses: docker/login-action@v3
