@@ -42,7 +42,7 @@ jobs:
       - name: Unit tests
         run: |
           pip install -r requirements.txt pytest
-          PYTHONPATH=. pytest -q tests/test_logic.py tests/test_assign.py tests/test_credentials.py
+          PYTHONPATH=. pytest -q tests/test_logic.py tests/test_assign.py
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -80,26 +80,6 @@ jobs:
           docker logs smoke
           sudo test -s smoke-data/state.json
           docker rm -f smoke
-
-      # No serial number or check code set: they come from a FlashForge WebUI
-      # folder whose file only root can read, and are kept in /data.
-      - name: Credentials from a WebUI folder
-        run: |
-          sudo mkdir webui smoke-data2
-          echo '{"lastUsedPrinterSerial":"SNTEST","printers":{"SNTEST":{"SerialNumber":"SNTEST","CheckCode":"cc1234","IPAddress":"127.0.0.1"}}}' \
-            | sudo tee webui/printer_details.json > /dev/null
-          sudo chmod 600 webui/printer_details.json
-          docker run -d --name smoke2 -p 8001:8000 \
-            -v "$PWD/webui:/import/flashforge-webui:ro" -v "$PWD/smoke-data2:/data" \
-            -e PRINTER_HOST=127.0.0.1 -e SPOOLMAN_URL=http://127.0.0.1:9 c5p-spoolman:test
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8001/healthz && break
-            sleep 1
-          done
-          docker logs smoke2 2>&1 | tee smoke2.log
-          grep -q "printer SNTEST: serial number and check code taken from" smoke2.log
-          sudo grep -q cc1234 smoke-data2/printer.json
-          docker rm -f smoke2
 
       - uses: docker/login-action@v3
         with:

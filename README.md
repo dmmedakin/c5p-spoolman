@@ -72,13 +72,8 @@ service matches it against Spoolman:
 
 ## Set up
 
-1. **The serial number and check code** are needed for the printer's local API.
-   If FlashForge WebUI was connected to the printer, mount its data folder at
-   `/import/flashforge-webui` and the service takes both from its
-   `printer_details.json` on the first start. It keeps a copy in
-   `/data/printer.json`, so the WebUI folder can be deleted afterwards. Otherwise
-   set `PRINTER_SERIAL` and `PRINTER_CHECK_CODE` from the printer's network
-   settings screen.
+1. **Find the serial number and check code.** Both are on the printer's
+   network settings screen (the same values FlashForge apps ask for in LAN mode).
 2. **Have your spools in Spoolman with their colour** (`color_hex` of the
    filament). Nothing else is needed: locations are set by the service.
 3. **Add the service** to your compose file:
@@ -90,6 +85,8 @@ service matches it against Spoolman:
     restart: unless-stopped
     environment:
       PRINTER_HOST: 192.168.0.81
+      PRINTER_SERIAL: "<serial>"
+      PRINTER_CHECK_CODE: "<check code>"
       SPOOLMAN_URL: http://spoolman:8000
       PRINTSTASH_URL: http://printstash:3000      # optional
       PRINTSTASH_USERNAME: "<user>"
@@ -98,7 +95,6 @@ service matches it against Spoolman:
       PUBLIC_URL: http://192.168.0.96:3065         # for the correction buttons
     volumes:
       - /srv/appdata/3dprint/c5p-spoolman:/data
-      - /srv/appdata/3dprint/flashforge-webui:/import/flashforge-webui:ro
     ports:
       - "3065:8000"
 ```
@@ -111,9 +107,8 @@ printer's own job summary.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PRINTER_HOST` | — | printer IP or name (required) |
-| `PRINTER_SERIAL` | from WebUI | serial number |
-| `PRINTER_CHECK_CODE` | from WebUI | check code |
-| `FLASHFORGE_WEBUI_DIR` | `/import/flashforge-webui` | WebUI data folder to take both from |
+| `PRINTER_SERIAL` | — | serial number (required) |
+| `PRINTER_CHECK_CODE` | — | check code (required) |
 | `PRINTER_PORT` | `8898` | local API port |
 | `SPOOLMAN_URL` | — | e.g. `http://spoolman:8000` (required) |
 | `SLOT_LOCATION` | `Creator 5 Pro / Slot {slot}` | Spoolman location of slot N |
@@ -155,7 +150,7 @@ PrintStash. These points about the printer itself are not confirmed yet:
 
 ```sh
 pip install -r requirements.txt pytest
-PYTHONPATH=. pytest -q tests/test_logic.py tests/test_assign.py tests/test_credentials.py
+PYTHONPATH=. pytest -q tests/test_logic.py tests/test_assign.py
 ```
 
 `tests/integration_test.py` runs the whole service against a local Spoolman on

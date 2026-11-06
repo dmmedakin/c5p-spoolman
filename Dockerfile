@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
  && useradd --no-create-home --uid 10001 --user-group app \
  && mkdir -p /data && chown app /data
 COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
-COPY service.py tracker.py allocate.py gcode_usage.py assign.py credentials.py /app/
+COPY service.py tracker.py allocate.py gcode_usage.py assign.py /app/
 
 # Starts as root only to take ownership of /data, then runs as "app" (entrypoint.sh)
 WORKDIR /app
