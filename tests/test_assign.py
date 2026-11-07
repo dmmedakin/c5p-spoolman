@@ -1,6 +1,6 @@
 """Unit tests: matching what a slot reports to a spool in Spoolman."""
 
-from assign import choose, family, slot_key
+from assign import choose, color_name, family, slot_key
 
 
 def spool(sid, fid, name, material, color, used=0.0, remaining=1000.0, location="Study / Wooden sideboard"):
@@ -32,7 +32,7 @@ def test_families():
 
 def test_identical_spools_need_no_question():
     c = choose("PETG", "#1A1A1A", SPOOLS)
-    assert c.spool["id"] == 2 and not c.doubtful
+    assert c.spool["id"] == 2 and not c.candidates
 
 
 def test_an_opened_spool_is_preferred():
@@ -47,36 +47,41 @@ def test_a_spool_in_another_slot_is_not_taken_twice():
 
 def test_clear_colour_match():
     c = choose("PLA", "#A8D8EA", SPOOLS)
-    assert c.spool["id"] == 5 and not c.doubtful
+    assert c.spool["id"] == 5 and not c.candidates
 
 
-def test_near_pinks_are_doubtful_with_the_other_offered():
-    c = choose("PLA", "#F2A7B5", SPOOLS)
-    assert c.spool["id"] == 1 and c.doubtful
-    assert [s["id"] for s, _ in c.alternatives] == [6]
+# What the printer really reported on 7 Nov 2026 while slot 1 was set up on its screen.
+
+def test_printer_default_coral_is_not_guessed_as_rose_quartz():
+    c = choose("PLA", "#FA6173", SPOOLS)
+    assert c.spool is None and not c.candidates and "no PLA spool" in c.reason
 
 
-def test_white_and_transparent_are_doubtful():
-    c = choose("PETG", "#FFFFFF", SPOOLS)
-    assert c.spool["id"] == 4 and c.doubtful and [s["id"] for s, _ in c.alternatives] == [8]
-
-
-def test_two_reds_are_doubtful():
+def test_coral_is_not_guessed_as_a_red():
     spools = SPOOLS + [spool(12, 11, "HS PETG Metallic Red", "PETG", "B0182A"),
                        spool(16, 15, "PETG Red", "PETG", "C8102E")]
-    c = choose("PETG", "#FF0000", spools)
-    assert c.spool["id"] == 16 and c.doubtful and [s["id"] for s, _ in c.alternatives] == [12]
+    c = choose("PETG", "#FA6173", spools)
+    assert c.spool is None and not c.candidates
+
+
+def test_white_and_transparent_are_asked_not_guessed():
+    c = choose("PETG", "#FFFFFF", SPOOLS)
+    assert c.spool is None and [s["id"] for s, _ in c.candidates] == [4, 8]
+
+
+def test_printer_black_matches_the_black_spool():
+    assert choose("PETG", "#1B1B1B", SPOOLS).spool["id"] == 2
+
+
+def test_a_close_pink_matches_only_the_pink_it_is_close_to():
+    c = choose("PLA", "#F2A7B5", SPOOLS)
+    assert c.spool["id"] == 1 and not c.candidates
 
 
 def test_material_keeps_families_apart():
     # A white PLA slot never picks the white PETG.
     c = choose("PLA", "#F2F2F2", SPOOLS)
-    assert c.spool is None or (c.spool.get("filament") or {}).get("material", "").startswith("PLA")
-
-
-def test_nothing_close_enough():
-    c = choose("PLA", "#00FF00", SPOOLS)
-    assert c.spool is None and "close" in c.reason
+    assert c.spool is None and not c.candidates
 
 
 def test_unknown_material():
@@ -85,10 +90,17 @@ def test_unknown_material():
 
 
 def test_a_location_already_set_wins():
-    c = choose("PLA", "#F2A7B5", SPOOLS, already_here=6)
-    assert c.spool["id"] == 6 and not c.doubtful
+    c = choose("PLA", "#FA6173", SPOOLS, already_here=6)
+    assert c.spool["id"] == 6
 
 
 def test_archived_spools_are_ignored():
     spools = [dict(s, archived=(s["id"] == 5)) for s in SPOOLS]
-    assert (choose("PLA", "#A8D8EA", spools).spool or {}).get("id") != 5
+    assert choose("PLA", "#A8D8EA", spools).spool is None
+
+
+def test_colour_names():
+    assert color_name("#FFFFFF") == "white (#FFFFFF)"
+    assert color_name("#FA6173").startswith("coral")
+    assert color_name("1B1B1B") == "black (#1B1B1B)"
+    assert color_name("") == "no colour"

@@ -35,26 +35,32 @@ replaces it; it only decides the split.
 
 The printer has no RFID. When a spool is loaded, its screen asks for the
 material and colour, and the printer reports that pair for each slot. The
-service matches it against Spoolman:
+service matches it against Spoolman, and never guesses:
 
+- **It waits for the choice to settle.** While a load is set up on the screen,
+  the printer reports every step (a default PLA in coral first, then each
+  change). A slot is matched only after its material and colour stayed the same
+  for `SLOT_SETTLE_S` (60 s), so one load gives one message.
 - **Same material family** (PLA, PLA+, HS PLA and PLA Wood are all PLA; PETG is
-  its own family), and **nearest colour**, measured as CIELAB ΔE so that beige is
-  not mistaken for pink.
-- **Several spools of one filament** (two identical black PETG) are the same choice
-  for accounting: an opened spool is taken first, then the emptiest, then the
-  oldest. Nothing is asked.
+  its own family) and **a colour within ΔE 12** (CIELAB). Measured on real
+  loads: the printer's white is 4.5 from a white spool and 6.7 from a clear
+  one, its black 0.5 from a black spool, while its coral default is 25 from a
+  red and 42 from a rose spool.
+- **One match:** its location becomes `Creator 5 Pro / Slot N` and a message
+  says so. Several spools of one filament (two identical black PETG) count as
+  one match: an opened spool is taken first, then the emptiest, then the oldest.
+- **Several different filaments match** (white and transparent): nothing is
+  set. The message lists them with a button each; a tap puts that spool in the
+  slot. The buttons need `PUBLIC_URL`, reachable from the phone (home Wi‑Fi).
+- **No match:** nothing is set, and the message says to add the spool to
+  Spoolman with its colour. Unmatched slots are checked again every
+  `RECHECK_S` (5 min), so a spool added later is assigned by itself.
+- **Use is never lost meanwhile:** what a slot feeds before its spool is known
+  is held and charged once it is.
 - **A spool whose location already names the slot** (set by hand) wins.
-- The chosen spool's location becomes `Creator 5 Pro / Slot N`. A spool taken out
-  of the slot gets back the location it had before.
-- **A doubtful match**, two different filaments close in colour (light pink and
-  rose quartz, white and transparent), still takes the best guess. The ntfy
-  message offers the others as buttons. A tap puts that spool in the slot and
-  moves whatever was already charged from the guessed spool to it. The buttons
-  need `PUBLIC_URL`, reachable from the phone (e.g. on the home Wi‑Fi).
-- **No matching spool** (a material or colour not in Spoolman): the slot's use is
-  not charged and you get a message.
-- A swap during a print is taken into account after the job is charged. Use
-  just before a swap stays with the spool that was taken out.
+- A spool taken out of the slot gets back the location it had before. Use just
+  before a swap stays with the spool that was taken out; a swap during a print
+  is taken into account after the job is charged.
 
 ### Reliability
 
@@ -118,6 +124,8 @@ printer's own job summary.
 | `PUBLIC_URL` | — | how the phone reaches this service; enables the correction buttons |
 | `ACTION_TOKEN` | generated | secret in the button links; kept in `DATA_DIR/action_token` |
 | `AUTO_ASSIGN` | `true` | match loaded spools and set their location |
+| `SLOT_SETTLE_S` | `60` | seconds a slot's material and colour must stay unchanged before matching |
+| `RECHECK_S` | `300` | how often a slot without a known spool is matched again |
 | `COUNT_IDLE_USE` | `true` | also charge loading, unloading and purges |
 | `POLL_INTERVAL_S` | `3` | seconds between reads |
 | `DATA_DIR` | `/data` | state and history |
@@ -128,8 +136,8 @@ printer's own job summary.
 - `GET /healthz`: 200 while the poll loop runs. A printer that is off is normal
   and does not make it unhealthy.
 - `GET /status`: printer state, the spool in each slot, the current job and its
-  per-slot metres so far, pending charges, the last error and the last 10
-  history entries.
+  per-slot metres so far, pending and held charges, the last error and the last
+  10 history entries.
 - `POST /assign?slot=N&spool=ID&token=…`: what a correction button calls.
 
 ## Still to confirm on a real printer
@@ -141,8 +149,8 @@ PrintStash. These points about the printer itself are not confirmed yet:
 - whether `currentSlot` follows the active head during a toolchange print, and
   whether slot N feeds head N;
 - whether polling port 8898 alongside Orca or FlashForge Studio causes any issue;
-- what the slots report as material and colour: the names in the printer's
-  material list and the colours of its palette;
+- the colours of the printer's palette beyond white `#FFFFFF`, black
+  `#1B1B1B` and its coral default `#FA6173`, seen on 7 Nov 2026;
 - how `printFileName` relates to the name stored in PrintStash. Matching uses the
   file stem, so `part.gcode.3mf` and `part.gcode` both match `part`.
 

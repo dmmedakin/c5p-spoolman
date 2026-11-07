@@ -5,8 +5,8 @@ screen for the material and the colour, and reports them per slot. That pair
 is matched against the spools in Spoolman: same material family, nearest
 colour. Several spools of one filament (two identical black PETG) are the same
 choice for accounting, so an opened one is preferred and there is nothing to
-ask. Two different filaments close in colour are a real doubt: the best guess
-is taken and the runners-up are offered for a one-tap correction.
+ask. Nothing is guessed: two different filaments that both match are a question
+for the user, and no match at all means the spool is not in Spoolman yet.
 """
 
 from __future__ import annotations
@@ -20,13 +20,11 @@ from allocate import _rgb
 # Material families, longest first so PETG is not read as PET.
 FAMILIES = ("PETG", "PCTG", "PLA", "ABS", "ASA", "TPU", "PET", "PVA", "HIPS", "PA", "PC", "PP")
 # Colour distances are CIELAB delta E (CIE76): about 2 is barely visible, 10 is
-# a clearly different shade. In plain RGB, beige sits as close to pink as two
-# pinks do; in Lab it does not.
-# Farther than this from the slot's colour, a spool is not a candidate at all
-# (the printer's palette is coarse: its pure red is ~36 from a real red).
-MAX_DISTANCE = 50.0
-# A different filament within this much of the best guess makes the choice doubtful.
-DOUBT_MARGIN = 12.0
+# a clearly different shade. Measured on real loads: the printer's white to a
+# white spool 4.5, to a clear one 6.7; black to black 0.5; while its coral
+# default to a rose and to a red spool was 42 and 25. A spool is a match only
+# within this distance.
+MATCH_DISTANCE = 12.0
 
 
 def _lab(color: str) -> tuple[float, float, float] | None:
@@ -74,10 +72,10 @@ def slot_key(loaded: bool, material: str, color: str) -> str:
 
 @dataclass
 class Choice:
+    """spool: the one match. candidates: several different filaments match, ask which."""
     spool: dict[str, Any] | None
     distance: float | None = None
-    doubtful: bool = False
-    alternatives: list[tuple[dict[str, Any], float]] = field(default_factory=list)
+    candidates: list[tuple[dict[str, Any], float]] = field(default_factory=list)
     reason: str = ""
 
 
@@ -98,7 +96,7 @@ def _preference(spool: dict[str, Any]) -> tuple:
 
 def choose(material: str, color: str, spools: list[dict[str, Any]], *,
            taken: set[int] = frozenset(), already_here: int | None = None) -> Choice:
-    """Pick the spool for a slot reporting material and colour.
+    """The spool for a slot reporting material and colour, the ones to ask about, or none.
 
     taken: spools assigned to other slots, never chosen twice.
     already_here: a spool whose Spoolman location already names this slot (set
@@ -107,31 +105,46 @@ def choose(material: str, color: str, spools: list[dict[str, Any]], *,
     fam = family(material)
     usable = [s for s in spools if not s.get("archived") and int(s["id"]) not in taken
               and family((s.get("filament") or {}).get("material", "")) == fam]
-    if not usable:
-        return Choice(None, reason=f"no {fam or 'such'} spool in Spoolman")
     if already_here is not None:
         for s in usable:
             if int(s["id"]) == already_here:
-                return Choice(s, _distance(color, _color_of(s)), reason="already set to this slot")
-    scored: list[tuple[float, dict[str, Any]]] = []
+                return Choice(s, _distance(color, _color_of(s)), reason="its location in Spoolman names this slot")
+    # One entry per filament: its preferred spool and that filament's distance.
+    by_filament: dict[int, tuple[float, dict[str, Any]]] = {}
     for s in usable:
         d = _distance(color, _color_of(s))
-        if d is not None and d <= MAX_DISTANCE:
-            scored.append((d, s))
-    if not scored:
-        return Choice(None, reason=f"no {fam} spool close to colour {color or '?'} in Spoolman")
-    # One entry per filament: its best spool and that filament's distance.
-    by_filament: dict[int, tuple[float, dict[str, Any]]] = {}
-    for d, s in scored:
+        if d is None or d > MATCH_DISTANCE:
+            continue
         fid = int((s.get("filament") or {}).get("id") or -int(s["id"]))
         cur = by_filament.get(fid)
         if cur is None or _preference(s) < _preference(cur[1]):
             by_filament[fid] = (d, s)
     ranked = sorted(by_filament.values(), key=lambda t: (t[0], _preference(t[1])))
-    best_d, best = ranked[0]
-    close = [(s, d) for d, s in ranked[1:] if d - best_d <= DOUBT_MARGIN]
-    return Choice(best, best_d, doubtful=bool(close), alternatives=close[:2],
-                  reason="nearest colour" + (", others are close" if close else ""))
+    if not ranked:
+        return Choice(None, reason=f"no {fam or 'such'} spool of this colour in Spoolman")
+    if len(ranked) == 1:
+        return Choice(ranked[0][1], ranked[0][0], reason="the only matching spool")
+    return Choice(None, candidates=[(s, d) for d, s in ranked[:3]],
+                  reason=f"{len(ranked)} different spools match")
+
+
+# Plain names for the colours a printer's palette and spools use.
+_NAMES = {
+    "white": "FFFFFF", "light grey": "C8C8C8", "grey": "8C8C8C", "dark grey": "4A4A4A", "black": "000000",
+    "red": "D01C1C", "dark red": "7A1020", "coral": "F7706A", "pink": "F4A6B8", "magenta": "D0308C",
+    "orange": "F08020", "yellow": "F5D000", "beige": "E3D3B4", "brown": "7A4A2A", "olive": "7A7A20",
+    "light green": "90D070", "green": "20A040", "dark green": "1F5A30", "teal": "20A0A0",
+    "light blue": "90C8E8", "blue": "2060D0", "navy": "1A2A6A", "purple": "6A3A9A", "lilac": "C0A0D8",
+}
+
+
+def color_name(color: str) -> str:
+    """'#FFFFFF' -> 'white (#FFFFFF)'."""
+    c = (color or "").upper()
+    if not _lab(c):
+        return c or "no colour"
+    name = min(_NAMES, key=lambda n: _distance(c, _NAMES[n]))
+    return f"{name} ({c if c.startswith('#') else '#' + c})"
 
 
 def describe(spool: dict[str, Any]) -> str:

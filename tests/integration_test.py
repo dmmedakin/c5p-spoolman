@@ -123,7 +123,7 @@ data_dir = tempfile.mkdtemp()
 ENV = dict(os.environ, PRINTER_HOST="127.0.0.1", PRINTER_PORT="18898", PRINTER_SERIAL="SN123", PRINTER_CHECK_CODE="CC456",
            SPOOLMAN_URL="http://127.0.0.1:7912", PRINTSTASH_URL="http://127.0.0.1:8000", PRINTSTASH_USERNAME=PS_USER,
            PRINTSTASH_API_KEY=PS_KEY, NTFY_URL="http://127.0.0.1:18898/c5p", POLL_INTERVAL_S="0.2",
-           PUBLIC_URL="http://127.0.0.1:18899", SLOT_LOCATION=SLOT_LOC,
+           PUBLIC_URL="http://127.0.0.1:18899", SLOT_LOCATION=SLOT_LOC, SLOT_SETTLE_S="1", RECHECK_S="2",
            DATA_DIR=data_dir, PORT="18899")
 
 
@@ -201,8 +201,9 @@ cum += 0.25; step(cum=cum)
 step(slot=4); cum += 0.3; step(cum=cum)
 time.sleep(1)
 check("idle use charged to slot 3", abs(used_g(spools[3]["id"]) - before3 - 250 * grams_per_mm) < 0.05)
-check("idle use on a slot without a matching spool is reported",
-      any("Slot 4" in n["body"] and "no PETG spool" in n["body"] for n in NTFY), str(NTFY))
+st = httpx.get("http://127.0.0.1:18899/status").json()
+check("idle use on a slot whose spool is not known is held, not lost",
+      any("slot 4" in h["why"] for h in st["held"]), st["held"])
 check("spool on the shelf untouched", used_g(spools["shelf"]["id"]) == 0)
 
 # 4. Cancelled job: live attribution, no sliced-file split.
@@ -216,13 +217,14 @@ d1, d3 = used_g(spools[1]["id"]) - before1, used_g(spools[3]["id"]) - before3
 check("cancelled job charged by live attribution", abs(d1 - 600 * grams_per_mm) < 0.05 and abs(d3 - 300 * grams_per_mm) < 0.05, f"{d1} {d3}")
 
 # 5. Automatic assignment: spools on the shelf, matched by what the slot reports.
-def spool_of(name, color):
-    f = c.post(f"{SPOOLMAN}/filament", json={"name": name, "vendor_id": vendor["id"], "material": "PLA+",
+def spool_of(name, color, material="PLA+"):
+    f = c.post(f"{SPOOLMAN}/filament", json={"name": name, "vendor_id": vendor["id"], "material": material,
                                             "density": 1.24, "diameter": 1.75, "weight": 1000, "color_hex": color}).json()
     return c.post(f"{SPOOLMAN}/spool", json={"filament_id": f["id"], "location": "Study / Shelf"}).json()
 
 
-ice, pink, rose = spool_of("Ice Blue", "A8D8EA"), spool_of("Light Pink", "E1A6AD"), spool_of("Rose Quartz", "C98BA8")
+ice = spool_of("Ice Blue", "A8D8EA")
+white, clear = spool_of("Matte White", "F2F2F2", "PETG"), spool_of("Transparent", "E8EEF0", "PETG")
 
 
 def loc(spool_id):
@@ -234,41 +236,66 @@ def set_slot(slot, material, color):
     info.update(materialName=material, materialColor=color, hasFilament=True)
 
 
+def slot2():
+    return [n for n in NTFY if n["title"].startswith("Slot 2") or "Slot 2" in n["title"]]
+
+
+# a) What the printer did on 7 Nov: a default PLA in coral first, then the real choice.
 NTFY.clear()
-set_slot(2, "PLA", "#A8D8EA")
-time.sleep(1)
-check("loaded spool gets the slot's location", loc(ice["id"]) == SLOT_LOC.format(slot=2), loc(ice["id"]))
-check("a clear match is announced without buttons",
-      any(n["title"] == "Slot 2: spool loaded" and not n["actions"] for n in NTFY), str(NTFY))
+set_slot(2, "PLA", "#FA6173"); time.sleep(0.5)
+set_slot(2, "PLA", "#A8D8EA"); time.sleep(2.5)
+check("intermediate states on the printer screen send nothing", len(slot2()) == 1, str(slot2()))
+check("the settled load is matched and announced",
+      loc(ice["id"]) == SLOT_LOC.format(slot=2) and slot2() and f"#{ice['id']}" in slot2()[0]["title"]
+      and "light blue" in slot2()[0]["body"], str(slot2()))
 step(slot=2); cum += 0.3; step(cum=cum); time.sleep(0.6)
-check("idle use goes to the assigned spool", abs(used_g(ice["id"]) - 300 * grams_per_mm) < 0.05, used_g(ice["id"]))
+check("idle use goes to the matched spool", abs(used_g(ice["id"]) - 300 * grams_per_mm) < 0.05, used_g(ice["id"]))
 
+# b) Swap for a white PETG: white and transparent both match, so the user is asked.
+cum += 0.1; set_printer(cum=cum); time.sleep(0.5)    # last use before the swap, below the flush size
 NTFY.clear()
-set_slot(2, "PLA", "#F2A7B5")       # swapped for a pink one; two pinks are close
-time.sleep(1)
-check("swapped-out spool goes back to its place", loc(ice["id"]) == "Study / Shelf", loc(ice["id"]))
-check("best guess takes the slot", loc(pink["id"]) == SLOT_LOC.format(slot=2), loc(pink["id"]))
-doubt = [n for n in NTFY if n["title"] == "Slot 2: best guess"]
-check("a doubtful match offers the other spool as a button",
-      bool(doubt) and any(f"spool={rose['id']}" in a["url"] for a in doubt[0]["actions"]), str(NTFY))
+set_slot(2, "PETG", "#FFFFFF"); time.sleep(2.5)
+check("use just before a swap stays with the old spool", abs(used_g(ice["id"]) - 400 * grams_per_mm) < 0.05,
+      used_g(ice["id"]))
+check("the spool taken out goes back to its place", loc(ice["id"]) == "Study / Shelf", loc(ice["id"]))
+ask = [n for n in NTFY if n["title"] == "❓ Slot 2: which spool?"]
+check("two matching spools: asked with a button each, nothing guessed",
+      len(ask) == 1 and len(ask[0]["actions"]) == 2 and loc(white["id"]) == "Study / Shelf"
+      and loc(clear["id"]) == "Study / Shelf", str(NTFY))
 cum += 0.4; step(cum=cum); time.sleep(0.6)
-check("use charged to the best guess", abs(used_g(pink["id"]) - 400 * grams_per_mm) < 0.05, used_g(pink["id"]))
-
-bad = httpx.post(doubt[0]["actions"][0]["url"].replace("token=", "token=x"))
-check("a wrong token is refused", bad.status_code == 403, bad.status_code)
-tap = httpx.post(doubt[0]["actions"][0]["url"])
-check("tapping the button corrects the slot", tap.status_code == 200 and loc(rose["id"]) == SLOT_LOC.format(slot=2),
-      f"{tap.status_code} {tap.text} {loc(rose['id'])}")
-check("the wrong guess goes back to its place", loc(pink["id"]) == "Study / Shelf", loc(pink["id"]))
-check("what was charged moves to the right spool",
-      used_g(pink["id"]) == 0 and abs(used_g(rose["id"]) - 400 * grams_per_mm) < 0.05,
-      f"{used_g(pink['id'])} {used_g(rose['id'])}")
-cum += 0.1; step(cum=cum); set_slot(2, "PLA", "#A8D8EA"); time.sleep(1)
-check("use just before a swap stays with the old spool",
-      abs(used_g(rose["id"]) - 500 * grams_per_mm) < 0.05 and loc(ice["id"]) == SLOT_LOC.format(slot=2),
-      f"{used_g(rose['id'])} {loc(ice['id'])}")
 st = httpx.get("http://127.0.0.1:18899/status").json()
-check("status lists the slots", st["slots"]["2"]["spool_id"] == ice["id"], st["slots"])
+check("use while waiting for the answer is held",
+      used_g(white["id"]) == 0 and any("slot 2" in h["why"] for h in st["held"]), st["held"])
+bad = httpx.post(ask[0]["actions"][0]["url"].replace("token=", "token=x"))
+check("a wrong token is refused", bad.status_code == 403, bad.status_code)
+pick = next(a for a in ask[0]["actions"] if f"spool={white['id']}" in a["url"])
+tap = httpx.post(pick["url"]); time.sleep(0.6)
+check("tapping a button puts that spool in the slot",
+      tap.status_code == 200 and loc(white["id"]) == SLOT_LOC.format(slot=2), f"{tap.status_code} {tap.text}")
+check("the held use is charged to the picked spool",
+      abs(used_g(white["id"]) - 400 * grams_per_mm) < 0.05 and used_g(clear["id"]) == 0
+      and not any("slot 2" in h["why"] for h in httpx.get("http://127.0.0.1:18899/status").json()["held"]),
+      used_g(white["id"]))
+
+# c) A colour that is in no spool: the user is told to add it; once added, it is matched by itself.
+NTFY.clear()
+set_slot(2, "PLA", "#3A7D44"); time.sleep(2.5)
+check("the spool picked before goes back to its place", loc(white["id"]) == "Study / Shelf", loc(white["id"]))
+missing = [n for n in NTFY if n["title"] == "⚠️ Slot 2: spool not in Spoolman"]
+check("no matching spool: told to add it, nothing guessed", len(missing) == 1 and "green" in missing[0]["body"],
+      str(NTFY))
+cum += 0.25; step(cum=cum); time.sleep(0.6)
+green = spool_of("Green", "3B7C45")
+time.sleep(3.5)
+check("a spool added to Spoolman later is matched by itself", loc(green["id"]) == SLOT_LOC.format(slot=2),
+      loc(green["id"]))
+check("and the held use is charged to it", abs(used_g(green["id"]) - 250 * grams_per_mm) < 0.05,
+      used_g(green["id"]))
+check("each outcome was announced once", len(missing) == 1 and len([n for n in NTFY if n["title"].startswith(
+      f"Slot 2: #{green['id']}")]) == 1, str(NTFY))
+st = httpx.get("http://127.0.0.1:18899/status").json()
+check("status lists the slots", st["slots"]["2"]["spool_id"] == green["id"] and st["slots"]["2"]["state"] == "matched",
+      st["slots"])
 
 # 6. Wrong check code: the service reports it and charges nothing.
 proc.terminate(); proc.wait()
